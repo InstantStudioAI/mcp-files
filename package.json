@@ -1,0 +1,28 @@
+{
+  "name": "@instantstudio/mcp-files",
+  "version": "0.1.0",
+  "description": "Local stdio MCP helper that uploads a user's on-disk file to an InstantStudio presigned URL — bytes never pass through the model.",
+  "type": "module",
+  "bin": {
+    "instantstudio-files": "src/index.js"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "instantstudio",
+    "upload"
+  ],
+  "license": "UNLICENSED",
+  "dependencies": {}
+}
