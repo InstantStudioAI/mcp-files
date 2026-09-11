@@ -1,24 +1,32 @@
-// Core file operations for the instantstudio-files MCP helper. Pure functions,
-// Node built-ins only (no dependencies), so the whole package is auditable and
-// npx-cold-starts instantly. The MCP/stdio wiring lives in index.js.
+// Core file op for the instantstudio-files MCP helper. One job: PUT a local
+// file's bytes to a short upload URL that request_upload handed the agent. Node
+// built-ins only (no dependencies).
 //
-// Flow this supports (docs/plans/mcp-file-ingress.md in pawsome-ai-web):
-//   hash_file(path)                        -> { byte_size, checksum, ... }
-//   (remote) request_upload(byte_size, checksum, ...) -> { put_url, headers, signed_id }
-//   upload_file(path, put_url, headers)    -> PUT the bytes to storage
-//   (remote) attach_asset(signed_id)       -> use it in a generation
+// Flow (docs/plans/mcp-file-ingress.md §12 in pawsome-ai-web):
+//   (remote) request_upload(filename?)      -> { upload_url, expires_at }
+//   upload_file(path, upload_url)            -> { ok, asset_ref, byte_size, mime_type }
+//   (remote) use asset_ref in update_spec / run_app image slots
 //
-// The checksum (base64 MD5) MUST be computed here, BEFORE request_upload, because
-// the server mints the presigned URL pinned to that exact MD5 + byte size. Bytes
-// never pass through the model or the MCP channel — only the PUT carries them.
+// The server derives size/checksum/type from the stream and returns a short
+// `asset_ref` — so no long opaque string ever crosses the model boundary. Bytes
+// never pass through the model.
 
 import { stat, readFile } from "node:fs/promises";
-import { createReadStream } from "node:fs";
-import { createHash } from "node:crypto";
-import { basename, extname } from "node:path";
+import { extname } from "node:path";
 
 // User-facing failures (bad path, rejected upload). Anything else is unexpected.
 export class ToolError extends Error {}
+
+// Defaults are read from env at call time so they can be tuned per deployment and
+// exercised in tests.
+const DEFAULT_MAX_BYTES = 25 * 1024 * 1024; // 25 MB — matches the InstantStudio upload limit; also bounds memory (we buffer the file)
+const DEFAULT_TIMEOUT_MS = 120_000; // 2 min
+const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
+
+function envNumber(name, fallback) {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
 
 const MIME_BY_EXT = {
   ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".gif": "image/gif",
@@ -30,28 +38,47 @@ const MIME_BY_EXT = {
   ".ogg": "audio/ogg", ".flac": "audio/flac"
 };
 
-// Best-effort content type from the extension; null when unknown (the caller can
-// still upload — request_upload's mime_type is optional).
+// Best-effort content type from the extension; sent only as a hint (the server
+// sniffs the real type). null when unknown.
 export function guessMime(path) {
   return MIME_BY_EXT[extname(String(path)).toLowerCase()] || null;
 }
 
-// Optional hardening: if INSTANTSTUDIO_FILES_ALLOWED_HOSTS is set (comma-separated
-// hosts), refuse to PUT anywhere else. Guards against a put_url from an untrusted
-// source turning the helper into a file-exfiltration primitive. Unset = allow any
-// (the put_url is expected to come from the trusted InstantStudio server).
-export function checkHostAllowed(putUrl, allowedEnv = process.env.INSTANTSTUDIO_FILES_ALLOWED_HOSTS) {
-  const allow = String(allowedEnv || "").split(",").map((s) => s.trim()).filter(Boolean);
-  if (allow.length === 0) return;
+// True when no host allowlist is configured — used to emit a one-time hardening
+// advisory at startup (see index.js).
+export function hostAllowlistConfigured(allowedEnv = process.env.INSTANTSTUDIO_FILES_ALLOWED_HOSTS) {
+  return String(allowedEnv || "").split(",").map((s) => s.trim()).filter(Boolean).length > 0;
+}
 
-  let host;
+// Guard against the helper being turned into a file-exfiltration primitive by an
+// upload_url from an untrusted source. Policy:
+//   * INSTANTSTUDIO_FILES_ALLOWED_HOSTS set  -> the host MUST match one of them
+//     (the operator's explicit trust list is the authority; any scheme).
+//   * otherwise                              -> require https, EXCEPT localhost
+//     (dev over http). This blocks plain-http exfil targets; pin hosts with the
+//     allowlist for stronger protection.
+export function assertUploadUrlAllowed(uploadUrl, allowedEnv = process.env.INSTANTSTUDIO_FILES_ALLOWED_HOSTS) {
+  let url;
   try {
-    host = new URL(putUrl).host;
+    url = new URL(uploadUrl);
   } catch {
-    throw new ToolError(`Invalid put_url: ${putUrl}`);
+    throw new ToolError(`Invalid upload_url: ${uploadUrl}`);
   }
-  const ok = allow.some((a) => host === a || host.endsWith("." + a));
-  if (!ok) throw new ToolError(`put_url host ${host} is not in INSTANTSTUDIO_FILES_ALLOWED_HOSTS`);
+
+  const allow = String(allowedEnv || "").split(",").map((s) => s.trim()).filter(Boolean);
+  if (allow.length > 0) {
+    const host = url.host;
+    const ok = allow.some((a) => host === a || host.endsWith("." + a));
+    if (!ok) throw new ToolError(`upload_url host ${host} is not in INSTANTSTUDIO_FILES_ALLOWED_HOSTS`);
+    return;
+  }
+
+  if (url.protocol !== "https:" && !LOCAL_HOSTS.has(url.hostname)) {
+    throw new ToolError(
+      `Refusing to upload to a non-https, non-localhost URL (${url.protocol}//${url.host}). ` +
+      "Set INSTANTSTUDIO_FILES_ALLOWED_HOSTS to allow it."
+    );
+  }
 }
 
 async function statFile(path) {
@@ -66,52 +93,41 @@ async function statFile(path) {
   return st;
 }
 
-// Compute the metadata request_upload needs. Streams the file so it never holds
-// more than a chunk in memory while hashing.
-export async function hashFile(path) {
+// PUT the file to the short upload URL. No checksum, no required headers — the
+// server derives everything from the stream. Returns the server's response
+// (notably `asset_ref`) merged with the local byte count. Bounded by a size cap
+// (we buffer the file) and a request timeout.
+export async function uploadFile(path, uploadUrl) {
+  if (typeof uploadUrl !== "string" || !uploadUrl) throw new ToolError("upload_url is required");
   const st = await statFile(path);
-  const md5 = createHash("md5");
-  const sha = createHash("sha256");
+  assertUploadUrlAllowed(uploadUrl);
 
-  await new Promise((resolve, reject) => {
-    const stream = createReadStream(path);
-    stream.on("data", (chunk) => {
-      md5.update(chunk);
-      sha.update(chunk);
-    });
-    stream.on("end", resolve);
-    stream.on("error", (e) => reject(new ToolError(`Could not read ${path}: ${e.message}`)));
-  });
-
-  return {
-    filename: basename(path),
-    byte_size: st.size,
-    checksum: md5.digest("base64"), // base64 MD5 — exactly what request_upload's `checksum` wants
-    sha256: sha.digest("hex"),
-    mime_type: guessMime(path)
-  };
-}
-
-// PUT the file's bytes to the presigned url, forwarding the server's headers
-// verbatim (they carry Content-Type / Content-MD5 the store verifies; the body
-// Buffer sets Content-Length). Bounded by the server's already-enforced size cap,
-// so a full read is fine here.
-export async function uploadFile(path, putUrl, headers) {
-  if (typeof putUrl !== "string" || !putUrl) throw new ToolError("put_url is required");
-  const st = await statFile(path);
-  checkHostAllowed(putUrl);
+  const cap = envNumber("INSTANTSTUDIO_FILES_MAX_BYTES", DEFAULT_MAX_BYTES);
+  if (st.size > cap) {
+    throw new ToolError(
+      `File is ${st.size} bytes; the local cap is ${cap} (set INSTANTSTUDIO_FILES_MAX_BYTES to change).`
+    );
+  }
 
   const body = await readFile(path);
 
+  const controller = new AbortController();
+  const timeout = envNumber("INSTANTSTUDIO_FILES_TIMEOUT_MS", DEFAULT_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeout);
+
   let res;
   try {
-    res = await fetch(putUrl, {
+    res = await fetch(uploadUrl, {
       method: "PUT",
-      headers: headers && typeof headers === "object" ? headers : {},
-      body
+      headers: { "Content-Type": guessMime(path) || "application/octet-stream" }, // a hint only
+      body,
+      signal: controller.signal
     });
   } catch (e) {
+    if (e?.name === "AbortError") throw new ToolError(`Upload timed out after ${timeout}ms`);
     throw new ToolError(`PUT request failed: ${e.message}`);
+  } finally {
+    clearTimeout(timer);
   }
 
   if (!res.ok) {
@@ -124,5 +140,12 @@ export async function uploadFile(path, putUrl, headers) {
     throw new ToolError(`Upload rejected: HTTP ${res.status} ${res.statusText}${detail ? " — " + detail : ""}`);
   }
 
-  return { ok: true, bytes: st.size, status: res.status };
+  let payload = {};
+  try {
+    payload = await res.json();
+  } catch {
+    /* server should return JSON, but don't fail the upload over a parse */
+  }
+
+  return { ok: true, bytes: st.size, ...payload };
 }

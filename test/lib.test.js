@@ -4,8 +4,7 @@ import { createServer } from "node:http";
 import { writeFile, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createHash } from "node:crypto";
-import { hashFile, uploadFile, guessMime, checkHostAllowed, ToolError } from "../src/lib.js";
+import { uploadFile, guessMime, assertUploadUrlAllowed, hostAllowlistConfigured, ToolError } from "../src/lib.js";
 
 async function withTempFile(bytes, name = "sample.png") {
   const dir = await mkdtemp(join(tmpdir(), "isf-"));
@@ -18,20 +17,24 @@ function listen(server) {
   return new Promise((resolve) => server.listen(0, () => resolve(server.address().port)));
 }
 
-test("hashFile returns size, base64 MD5, sha256, filename and mime", async () => {
-  const bytes = Buffer.from("hello world");
-  const { path, cleanup } = await withTempFile(bytes, "pic.JPG");
-  try {
-    const r = await hashFile(path);
-    assert.equal(r.byte_size, bytes.length);
-    assert.equal(r.checksum, createHash("md5").update(bytes).digest("base64"));
-    assert.equal(r.sha256, createHash("sha256").update(bytes).digest("hex"));
-    assert.equal(r.mime_type, "image/jpeg"); // extension match is case-insensitive
-    assert.equal(r.filename, "pic.JPG");
-  } finally {
-    await cleanup();
+function withEnv(vars, fn) {
+  const saved = {};
+  for (const [k, v] of Object.entries(vars)) {
+    saved[k] = process.env[k];
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
   }
-});
+  return (async () => {
+    try {
+      return await fn();
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  })();
+}
 
 test("guessMime maps known extensions and returns null otherwise", () => {
   assert.equal(guessMime("/a/b.png"), "image/png");
@@ -39,41 +42,33 @@ test("guessMime maps known extensions and returns null otherwise", () => {
   assert.equal(guessMime("/a/b.xyz"), null);
 });
 
-test("hashFile rejects a missing file with a ToolError", async () => {
-  await assert.rejects(() => hashFile("/no/such/file.png"), ToolError);
-});
-
-test("uploadFile PUTs the bytes with forwarded headers and reports ok", async () => {
+test("uploadFile PUTs the bytes and returns the server's asset_ref + byte count", async () => {
   const bytes = Buffer.from("some image bytes here");
   const captured = {};
   const server = createServer((req, res) => {
     captured.method = req.method;
     captured.ctype = req.headers["content-type"];
-    captured.md5 = req.headers["content-md5"];
     captured.length = req.headers["content-length"];
     const chunks = [];
     req.on("data", (c) => chunks.push(c));
     req.on("end", () => {
       captured.body = Buffer.concat(chunks);
-      res.statusCode = 200;
-      res.end("ok");
+      res.statusCode = 201;
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify({ asset_ref: "H3N8VW2BK5QD", byte_size: bytes.length, mime_type: "image/png" }));
     });
   });
   const port = await listen(server);
   const { path, cleanup } = await withTempFile(bytes, "x.png");
   try {
-    const md5 = createHash("md5").update(bytes).digest("base64");
-    const r = await uploadFile(path, `http://127.0.0.1:${port}/blob`, {
-      "Content-Type": "image/png",
-      "Content-MD5": md5
-    });
+    // 127.0.0.1 is localhost, so allowed over http without an allowlist.
+    const r = await uploadFile(path, `http://127.0.0.1:${port}/u/ABCDEFGHJKMN`);
     assert.equal(r.ok, true);
+    assert.equal(r.asset_ref, "H3N8VW2BK5QD");
     assert.equal(r.bytes, bytes.length);
-    assert.equal(r.status, 200);
     assert.equal(captured.method, "PUT");
     assert.equal(captured.ctype, "image/png");
-    assert.equal(captured.md5, md5);
-    assert.equal(captured.length, String(bytes.length)); // exact Content-Length, no chunked
+    assert.equal(captured.length, String(bytes.length));
     assert.deepEqual(captured.body, bytes);
   } finally {
     await cleanup();
@@ -83,26 +78,69 @@ test("uploadFile PUTs the bytes with forwarded headers and reports ok", async ()
 
 test("uploadFile throws a ToolError carrying the status on a non-2xx response", async () => {
   const server = createServer((_req, res) => {
-    res.statusCode = 403;
-    res.end("SignatureDoesNotMatch");
+    res.statusCode = 410;
+    res.end('{"error":"slug_expired"}');
   });
   const port = await listen(server);
   const { path, cleanup } = await withTempFile(Buffer.from("x"), "x.png");
   try {
-    await assert.rejects(() => uploadFile(path, `http://127.0.0.1:${port}/blob`, {}), /403/);
+    await assert.rejects(() => uploadFile(path, `http://127.0.0.1:${port}/u/ABCDEFGHJKMN`), /410/);
   } finally {
     await cleanup();
     server.close();
   }
 });
 
-test("uploadFile requires a put_url and an existing file", async () => {
+test("uploadFile requires an upload_url and an existing file", async () => {
   await assert.rejects(() => uploadFile("/tmp/whatever.png", ""), ToolError);
-  await assert.rejects(() => uploadFile("/no/such/file.png", "http://127.0.0.1:1/x"), ToolError);
+  await assert.rejects(() => uploadFile("/no/such/file.png", "https://ex.com/u/x"), ToolError);
 });
 
-test("checkHostAllowed enforces an allowlist only when configured", () => {
-  assert.throws(() => checkHostAllowed("https://evil.example/x", "storage.instantstudio.ai"), ToolError);
-  assert.doesNotThrow(() => checkHostAllowed("https://f005.backblazeb2.com/x", "backblazeb2.com"));
-  assert.doesNotThrow(() => checkHostAllowed("https://anything.example/x", "")); // unset = allow any
+test("uploadFile enforces the size cap before uploading", async () => {
+  const { path, cleanup } = await withTempFile(Buffer.alloc(64), "big.png");
+  try {
+    await withEnv({ INSTANTSTUDIO_FILES_MAX_BYTES: "16" }, async () => {
+      await assert.rejects(() => uploadFile(path, "http://127.0.0.1:1/u/ABCDEFGHJKMN"), /cap/);
+    });
+  } finally {
+    await cleanup();
+  }
+});
+
+test("uploadFile times out a stalled request", async () => {
+  const server = createServer((req, _res) => {
+    req.on("data", () => {});
+    req.on("end", () => { /* never respond → force a timeout */ });
+  });
+  const port = await listen(server);
+  const { path, cleanup } = await withTempFile(Buffer.from("x"), "x.png");
+  try {
+    await withEnv({ INSTANTSTUDIO_FILES_TIMEOUT_MS: "80" }, async () => {
+      await assert.rejects(() => uploadFile(path, `http://127.0.0.1:${port}/u/ABCDEFGHJKMN`), /timed out/);
+    });
+  } finally {
+    await cleanup();
+    server.close();
+  }
+});
+
+test("assertUploadUrlAllowed: https anywhere ok; http only for localhost; else refused", () => {
+  assert.doesNotThrow(() => assertUploadUrlAllowed("https://toolkit.instantstudio.ai/u/x", ""));
+  assert.doesNotThrow(() => assertUploadUrlAllowed("http://localhost:3000/u/x", ""));
+  assert.doesNotThrow(() => assertUploadUrlAllowed("http://127.0.0.1:3000/u/x", ""));
+  assert.throws(() => assertUploadUrlAllowed("http://evil.example/collect", ""), /non-https/);
+  assert.throws(() => assertUploadUrlAllowed("not-a-url", ""), /Invalid upload_url/);
+});
+
+test("assertUploadUrlAllowed: an allowlist is the authority (matches by host / suffix)", () => {
+  assert.doesNotThrow(() => assertUploadUrlAllowed("https://cdn.instantstudio.ai/u/x", "instantstudio.ai"));
+  // allowlist lets even a non-https host through — the operator trusts it explicitly
+  assert.doesNotThrow(() => assertUploadUrlAllowed("http://storage.internal/u/x", "storage.internal"));
+  assert.throws(() => assertUploadUrlAllowed("https://evil.example/u/x", "instantstudio.ai"), /not in INSTANTSTUDIO_FILES_ALLOWED_HOSTS/);
+});
+
+test("hostAllowlistConfigured reflects the env", () => {
+  assert.equal(hostAllowlistConfigured(""), false);
+  assert.equal(hostAllowlistConfigured("  "), false);
+  assert.equal(hostAllowlistConfigured("instantstudio.ai"), true);
 });

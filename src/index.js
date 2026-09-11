@@ -1,10 +1,10 @@
 #!/usr/bin/env node
-// instantstudio-files — a local stdio MCP server that gives an agent two tools:
-// hash a local file, and PUT its bytes to a presigned URL. It runs on the user's
-// machine (the one place with filesystem access) so files that live on disk can
-// reach InstantStudio without their bytes passing through the model or the MCP
-// channel. It holds NO credentials and needs NO config: the put_url minted by the
-// remote InstantStudio MCP server carries all the authority.
+// instantstudio-files — a local stdio MCP server exposing ONE tool, upload_file:
+// PUT a local file's bytes to a short upload URL that the remote InstantStudio
+// MCP server minted (via request_upload). It runs on the user's machine (the one
+// place with filesystem access) so files on disk reach InstantStudio without
+// their bytes passing through the model or the MCP channel. It holds NO
+// credentials and needs NO config: the upload_url carries all the authority.
 //
 // Deliberately zero-dependency: the MCP stdio transport is newline-delimited
 // JSON-RPC 2.0, and the surface we need (initialize / tools/list / tools/call /
@@ -12,44 +12,36 @@
 // npx-distributed, filesystem-touching helper auditable and its cold start fast.
 
 import { createInterface } from "node:readline";
-import { hashFile, uploadFile, ToolError } from "./lib.js";
+import { readFileSync } from "node:fs";
+import { uploadFile, hostAllowlistConfigured, ToolError } from "./lib.js";
 
-const SERVER_INFO = { name: "instantstudio-files", version: "0.1.0" };
+const { version } = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+const SERVER_INFO = { name: "instantstudio-files", version };
 // Echoed back to the client on initialize; used only if the client omits its own.
 const FALLBACK_PROTOCOL = "2025-06-18";
 
+// One-time hardening advisory (stderr only — never the protocol channel on stdout).
+if (!hostAllowlistConfigured()) {
+  process.stderr.write(
+    "[instantstudio-files] no INSTANTSTUDIO_FILES_ALLOWED_HOSTS set — uploading only to https URLs (or " +
+    "localhost). Set it to pin the allowed upload host(s) for stronger protection.\n"
+  );
+}
+
 const TOOLS = [
-  {
-    name: "hash_file",
-    description:
-      "Compute a LOCAL file's size and checksum so you can call the remote request_upload tool. Returns " +
-      "{ filename, byte_size, checksum (base64 MD5), sha256, mime_type }. Call this FIRST for a local file: " +
-      "request_upload needs byte_size and checksum (and takes filename/mime_type) to mint the presigned upload.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        path: { type: "string", description: "Absolute path to the local file." }
-      },
-      required: ["path"]
-    }
-  },
   {
     name: "upload_file",
     description:
-      "PUT a LOCAL file's bytes to a presigned put_url returned by request_upload, sending its headers verbatim " +
-      "(they carry Content-Type / Content-MD5 the store verifies). Returns { ok, bytes, status }. On success, " +
-      "call attach_asset(signed_id:) with the signed_id from request_upload to use the file in a generation.",
+      "Upload a LOCAL file to InstantStudio: PUT its bytes to the `upload_url` that request_upload returned. " +
+      "Returns { asset_ref, byte_size, mime_type } — `asset_ref` is a short handle; put it into update_spec / " +
+      "run_app image slots. No hashing or headers needed; the server derives size/type from the bytes.",
     inputSchema: {
       type: "object",
       properties: {
-        path: { type: "string", description: "Absolute path to the local file (the same one you hashed)." },
-        put_url: { type: "string", description: "The presigned PUT url from request_upload." },
-        headers: {
-          type: "object",
-          description: "The headers object from request_upload; forward every entry verbatim on the PUT."
-        }
+        path: { type: "string", description: "Absolute path to the local file to upload." },
+        upload_url: { type: "string", description: "The upload_url from request_upload." }
       },
-      required: ["path", "put_url"]
+      required: ["path", "upload_url"]
     }
   }
 ];
@@ -68,10 +60,8 @@ function replyError(id, code, message) {
 
 async function runTool(name, args) {
   switch (name) {
-    case "hash_file":
-      return hashFile(args?.path);
     case "upload_file":
-      return uploadFile(args?.path, args?.put_url, args?.headers);
+      return uploadFile(args?.path, args?.upload_url);
     default:
       throw new ToolError(`Unknown tool: ${name}`);
   }
@@ -135,4 +125,14 @@ rl.on("line", (line) => {
   Promise.resolve(handle(message)).catch((e) => {
     process.stderr.write(`[instantstudio-files] handler error: ${e?.stack || e}\n`);
   });
+});
+
+// Observability only — does NOT change behavior. A stdio MCP server is shut down
+// by the client closing its stdin (the spec's terminate signal), at which point
+// this process exits once any in-flight call drains. We log that transition so a
+// teardown is unambiguous in the client's captured stderr (e.g. mcp-stderr.log)
+// instead of looking like a silent death. No process.exit(): letting the loop
+// drain naturally preserves completion of an upload that was in flight at EOF.
+rl.on("close", () => {
+  process.stderr.write("[instantstudio-files] stdin closed by client; exiting after any in-flight call drains\n");
 });
