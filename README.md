@@ -56,8 +56,8 @@ MCP server alongside the InstantStudio remote server, then reconnect.
 
 Pin the version so an install can't be surprised by a new release. Config file
 locations vary by client (e.g. `~/.cursor/mcp.json`, the VS Code `mcp.json`,
-`~/.codex/config.toml`). For Claude (Cowork / Desktop / Code) the InstantStudio plugin
-bundles this server, so no manual config is needed.
+`~/.codex/config.toml`). A batteries-included bundle that ships this helper alongside the
+InstantStudio remote server is planned; until then, add the two entries above manually.
 
 ## Tool
 
