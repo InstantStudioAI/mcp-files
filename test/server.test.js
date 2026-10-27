@@ -20,7 +20,7 @@ test("stdio server: initialize, tools/list, tools/call, errors", async () => {
       captured.body = Buffer.concat(chunks);
       res.statusCode = 201;
       res.setHeader("Content-Type", "application/json");
-      res.end(JSON.stringify({ asset_ref: "H3N8VW2BK5QD", byte_size: captured.body.length, mime_type: "image/png" }));
+      res.end(JSON.stringify({ asset_id: "3f2b6c1e-8a4d-4f7b-9c2e-5d1a7b8e9f00", byte_size: captured.body.length, mime_type: "image/png" }));
     });
   });
   const port = await new Promise((r) => sink.listen(0, () => r(sink.address().port)));
@@ -76,7 +76,7 @@ test("stdio server: initialize, tools/list, tools/call, errors", async () => {
     });
     const uploaded = await waitFor(3);
     assert.equal(uploaded.result.isError, false);
-    assert.equal(uploaded.result.structuredContent.asset_ref, "H3N8VW2BK5QD");
+    assert.equal(uploaded.result.structuredContent.asset_id, "3f2b6c1e-8a4d-4f7b-9c2e-5d1a7b8e9f00");
     assert.equal(captured.method, "PUT");
     assert.deepEqual(captured.body, bytes);
 

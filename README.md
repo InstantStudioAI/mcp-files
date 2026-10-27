@@ -10,7 +10,7 @@ and gives the agent a single tool: **PUT a local file to a short upload URL**. T
 bytes go straight to the server; they never pass through the model or the MCP channel.
 
 It is the local half of InstantStudio's file-ingress flow. The remote InstantStudio
-MCP server (`instantstudio-remote`) mints a short, single-use `upload_url` and holds
+MCP server mints a short, single-use `upload_url` and holds
 all the auth; this helper just streams the file there. It stores **no credentials** and
 needs **no config**.
 
@@ -20,15 +20,16 @@ under `npx`.
 ## The flow
 
 ```
-request_upload(filename?)             -> { upload_url, expires_at }     [remote tool]
-upload_file(path, upload_url)         -> { asset_ref, byte_size, mime_type }
-use asset_ref in update_spec / run_app image slots                     [remote tools]
+asset_upload(filename?)               -> { upload_url, expires_at }     [remote tool]
+upload_file(path, upload_url)         -> { asset_id, byte_size, mime_type }
+use asset_id in image slots or canvas fields                           [remote tools]
 ```
 
 The server derives size, checksum, and content type from the uploaded stream and
-returns a short **`asset_ref`** — a durable handle the agent uses afterwards. No
-hashing, no checksums, no headers to manage: the only things that cross the model are
-two short, typo-resistant slugs (the `upload_url` and the `asset_ref`).
+returns the upload's **`asset_id`**, the durable handle the agent uses afterwards in
+image slots (`app_run`, the typed app tools, `draft_update`) and canvas fields. No
+hashing, no checksums, no headers to manage. The server's response is passed through
+as it is.
 
 ## Requirements
 
@@ -42,13 +43,13 @@ MCP server alongside the InstantStudio remote server, then reconnect.
 ```json
 {
   "mcpServers": {
-    "instantstudio-remote": {
+    "instantstudio": {
       "type": "http",
       "url": "https://toolkit.instantstudio.ai/mcp"
     },
     "instantstudio-files": {
       "command": "npx",
-      "args": ["-y", "@instantstudio/mcp-files@0.1.0"]
+      "args": ["-y", "@instantstudio/mcp-files@0.2.0"]
     }
   }
 }
@@ -62,11 +63,11 @@ InstantStudio remote server is planned; until then, add the two entries above ma
 ## Tool
 
 ### `upload_file(path, upload_url)`
-PUT the local file at `path` to the `upload_url` from `request_upload`. Sends the
+PUT the local file at `path` to the `upload_url` from `asset_upload`. Sends the
 file's extension-guessed `Content-Type` as a hint (the server sniffs the real type).
-Returns `{ ok, bytes, asset_ref, byte_size, mime_type }`, or a `ToolError` carrying the
+Returns `{ ok, bytes, asset_id, byte_size, mime_type }`, or a `ToolError` carrying the
 server's HTTP status on rejection (e.g. `410` = the upload_url expired → call
-`request_upload` again).
+`asset_upload` again).
 
 ## Environment variables
 

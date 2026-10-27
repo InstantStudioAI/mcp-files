@@ -3,7 +3,18 @@
 All notable changes are documented here. This project follows
 [Semantic Versioning](https://semver.org).
 
-## 0.1.0 — unreleased
+## 0.2.0 — unreleased
+
+- `upload_file` returns the upload's **`asset_id`** (its uuid), the one file handle
+  the InstantStudio remote tools take; the server retired the 12-character
+  `asset_ref` on 2026-10-27. The tool still passes the server's response through as
+  it is, so 0.1.0 keeps working: this release corrects the tool description, README
+  and tests, which promised `asset_ref`.
+- Names the current remote tools (`asset_upload`, `app_run`, `draft_update`, the
+  typed app tools, canvas fields) instead of the names they had before 2026-09-28
+  (`request_upload`, `update_spec`, `run_app`).
+
+## 0.1.0 — 2026-09-14
 
 Initial release.
 

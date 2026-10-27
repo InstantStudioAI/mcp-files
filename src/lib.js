@@ -1,15 +1,17 @@
 // Core file op for the instantstudio-files MCP helper. One job: PUT a local
-// file's bytes to a short upload URL that request_upload handed the agent. Node
+// file's bytes to a short upload URL that asset_upload handed the agent. Node
 // built-ins only (no dependencies).
 //
-// Flow (docs/plans/mcp-file-ingress.md §12 in pawsome-ai-web):
-//   (remote) request_upload(filename?)      -> { upload_url, expires_at }
-//   upload_file(path, upload_url)            -> { ok, asset_ref, byte_size, mime_type }
-//   (remote) use asset_ref in update_spec / run_app image slots
+// Flow (docs/decisions/pending-upload-state-in-redis.md in pawsome-ai-web):
+//   (remote) asset_upload(filename?)         -> { upload_url, expires_at }
+//   upload_file(path, upload_url)            -> { ok, asset_id, byte_size, mime_type }
+//   (remote) use asset_id in image slots (app_run, the typed app tools,
+//            draft_update) or canvas fields
 //
-// The server derives size/checksum/type from the stream and returns a short
-// `asset_ref` — so no long opaque string ever crosses the model boundary. Bytes
-// never pass through the model.
+// The server derives size/checksum/type from the stream and returns the upload's
+// `asset_id` (its uuid), the one file handle the remote tools take. Bytes never
+// pass through the model. The server's response is passed through as it is, so a
+// field the server adds reaches the agent without a release here.
 
 import { stat, readFile } from "node:fs/promises";
 import { extname } from "node:path";
@@ -95,7 +97,7 @@ async function statFile(path) {
 
 // PUT the file to the short upload URL. No checksum, no required headers — the
 // server derives everything from the stream. Returns the server's response
-// (notably `asset_ref`) merged with the local byte count. Bounded by a size cap
+// (notably `asset_id`) merged with the local byte count. Bounded by a size cap
 // (we buffer the file) and a request timeout.
 export async function uploadFile(path, uploadUrl) {
   if (typeof uploadUrl !== "string" || !uploadUrl) throw new ToolError("upload_url is required");

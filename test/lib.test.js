@@ -42,7 +42,7 @@ test("guessMime maps known extensions and returns null otherwise", () => {
   assert.equal(guessMime("/a/b.xyz"), null);
 });
 
-test("uploadFile PUTs the bytes and returns the server's asset_ref + byte count", async () => {
+test("uploadFile PUTs the bytes and returns the server's asset_id + byte count", async () => {
   const bytes = Buffer.from("some image bytes here");
   const captured = {};
   const server = createServer((req, res) => {
@@ -55,7 +55,7 @@ test("uploadFile PUTs the bytes and returns the server's asset_ref + byte count"
       captured.body = Buffer.concat(chunks);
       res.statusCode = 201;
       res.setHeader("Content-Type", "application/json");
-      res.end(JSON.stringify({ asset_ref: "H3N8VW2BK5QD", byte_size: bytes.length, mime_type: "image/png" }));
+      res.end(JSON.stringify({ asset_id: "3f2b6c1e-8a4d-4f7b-9c2e-5d1a7b8e9f00", byte_size: bytes.length, mime_type: "image/png" }));
     });
   });
   const port = await listen(server);
@@ -64,7 +64,7 @@ test("uploadFile PUTs the bytes and returns the server's asset_ref + byte count"
     // 127.0.0.1 is localhost, so allowed over http without an allowlist.
     const r = await uploadFile(path, `http://127.0.0.1:${port}/u/ABCDEFGHJKMN`);
     assert.equal(r.ok, true);
-    assert.equal(r.asset_ref, "H3N8VW2BK5QD");
+    assert.equal(r.asset_id, "3f2b6c1e-8a4d-4f7b-9c2e-5d1a7b8e9f00");
     assert.equal(r.bytes, bytes.length);
     assert.equal(captured.method, "PUT");
     assert.equal(captured.ctype, "image/png");

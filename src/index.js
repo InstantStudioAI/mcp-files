@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // instantstudio-files — a local stdio MCP server exposing ONE tool, upload_file:
 // PUT a local file's bytes to a short upload URL that the remote InstantStudio
-// MCP server minted (via request_upload). It runs on the user's machine (the one
+// MCP server minted (via asset_upload). It runs on the user's machine (the one
 // place with filesystem access) so files on disk reach InstantStudio without
 // their bytes passing through the model or the MCP channel. It holds NO
 // credentials and needs NO config: the upload_url carries all the authority.
@@ -32,14 +32,14 @@ const TOOLS = [
   {
     name: "upload_file",
     description:
-      "Upload a LOCAL file to InstantStudio: PUT its bytes to the `upload_url` that request_upload returned. " +
-      "Returns { asset_ref, byte_size, mime_type } — `asset_ref` is a short handle; put it into update_spec / " +
-      "run_app image slots. No hashing or headers needed; the server derives size/type from the bytes.",
+      "Upload a LOCAL file to InstantStudio: PUT its bytes to the `upload_url` that asset_upload returned. " +
+      "Returns { asset_id, byte_size, mime_type }: put asset_id into image slots (app_run, the typed app tools, " +
+      "draft_update) or canvas fields. No hashing or headers needed; the server derives size/type from the bytes.",
     inputSchema: {
       type: "object",
       properties: {
         path: { type: "string", description: "Absolute path to the local file to upload." },
-        upload_url: { type: "string", description: "The upload_url from request_upload." }
+        upload_url: { type: "string", description: "The upload_url from asset_upload." }
       },
       required: ["path", "upload_url"]
     }

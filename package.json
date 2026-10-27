@@ -1,6 +1,6 @@
 {
   "name": "@instantstudio/mcp-files",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Local stdio MCP helper that uploads a file from the user's disk to InstantStudio via a short upload URL — the bytes never pass through the model.",
   "type": "module",
   "bin": {
