@@ -21,8 +21,13 @@ export class ToolError extends Error {}
 
 // Defaults are read from env at call time so they can be tuned per deployment and
 // exercised in tests.
-const DEFAULT_MAX_BYTES = 25 * 1024 * 1024; // 25 MB — matches the InstantStudio upload limit; also bounds memory (we buffer the file)
-const DEFAULT_TIMEOUT_MS = 120_000; // 2 min
+// 100 MB: Toolkit's default upload limit (max_upload_file_size_mb, raised from
+// 25 MB in pawsome-ai-web #18984 so a finished 1080P video fits). It also bounds
+// memory, since the file is buffered. The server's own 413 still decides.
+const DEFAULT_MAX_BYTES = 100 * 1024 * 1024;
+// The whole PUT, not just a stall: 100 MB at 5 Mbit/s up takes about 170 s, so
+// the old 2 minutes cut off healthy uploads on a slow line.
+const DEFAULT_TIMEOUT_MS = 600_000; // 10 min
 const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
 
 function envNumber(name, fallback) {

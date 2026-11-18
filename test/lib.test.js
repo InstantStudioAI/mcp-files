@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { writeFile, mkdtemp, rm } from "node:fs/promises";
+import { writeFile, mkdtemp, rm, truncate } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { uploadFile, guessMime, assertUploadUrlAllowed, hostAllowlistConfigured, ToolError } from "../src/lib.js";
@@ -104,6 +104,53 @@ test("uploadFile enforces the size cap before uploading", async () => {
     });
   } finally {
     await cleanup();
+  }
+});
+
+// The default cap matches the server's default limit, 100 MB (pawsome-ai-web
+// #18984). Sparse files, so the tests cost no disk.
+const DEFAULT_CAP = 100 * 1024 * 1024;
+
+async function withSparseFile(size, name) {
+  const file = await withTempFile(Buffer.alloc(0), name);
+  await truncate(file.path, size);
+  return file;
+}
+
+test("the default cap refuses a file one byte over 100 MB before any request", async () => {
+  const { path, cleanup } = await withSparseFile(DEFAULT_CAP + 1, "cut.mp4");
+  try {
+    await withEnv({ INSTANTSTUDIO_FILES_MAX_BYTES: undefined }, async () => {
+      // Port 1 refuses connections: reaching fetch would fail differently.
+      await assert.rejects(() => uploadFile(path, "http://127.0.0.1:1/u/ABCDEFGHJKMN"),
+                           /File is 104857601 bytes; the local cap is 104857600/);
+    });
+  } finally {
+    await cleanup();
+  }
+});
+
+test("the default cap sends a file of exactly 100 MB", async () => {
+  let received = 0;
+  const server = createServer((req, res) => {
+    req.on("data", (chunk) => { received += chunk.length; });
+    req.on("end", () => {
+      res.writeHead(201, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ asset_id: "9f8e7d6c-0000-4000-8000-000000000000", byte_size: received }));
+    });
+  });
+  const port = await listen(server);
+  const { path, cleanup } = await withSparseFile(DEFAULT_CAP, "cut.mp4");
+  try {
+    await withEnv({ INSTANTSTUDIO_FILES_MAX_BYTES: undefined }, async () => {
+      const result = await uploadFile(path, `http://127.0.0.1:${port}/u/ABCDEFGHJKMN`);
+      assert.equal(result.ok, true);
+      assert.equal(result.bytes, DEFAULT_CAP);
+      assert.equal(received, DEFAULT_CAP, "the whole file reached the server");
+    });
+  } finally {
+    await cleanup();
+    server.close();
   }
 });
 

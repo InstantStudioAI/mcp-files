@@ -76,8 +76,8 @@ All optional:
 | Variable | Default | Purpose |
 |---|---|---|
 | `INSTANTSTUDIO_FILES_ALLOWED_HOSTS` | *(unset)* | Comma-separated host allowlist. When set, only these hosts may receive an upload (matched by host or `.suffix`), and it becomes the authority. |
-| `INSTANTSTUDIO_FILES_MAX_BYTES` | `26214400` (25 MB) | Reject files larger than this — matches the InstantStudio upload limit (the file is buffered in memory). |
-| `INSTANTSTUDIO_FILES_TIMEOUT_MS` | `120000` | Abort a PUT that stalls longer than this. |
+| `INSTANTSTUDIO_FILES_MAX_BYTES` | `104857600` (100 MB) | Reject files larger than this before sending them. Matches the InstantStudio upload limit's default; the file is buffered in memory, and the server's own limit still applies. |
+| `INSTANTSTUDIO_FILES_TIMEOUT_MS` | `600000` (10 min) | Abort a PUT that has not finished after this long (the whole transfer, not only a stall). |
 
 ## Security
 

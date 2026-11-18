@@ -3,7 +3,18 @@
 All notable changes are documented here. This project follows
 [Semantic Versioning](https://semver.org).
 
-## 0.2.0 — unreleased
+## 0.2.1 — unreleased
+
+- The size cap defaults to **100 MB** (`104857600`), up from 25 MB, to match the
+  InstantStudio upload limit, which now reads the platform's
+  `max_upload_file_size_mb` (100 MB by default) so a finished 1080P video can be
+  uploaded. `INSTANTSTUDIO_FILES_MAX_BYTES` still overrides it.
+- The request timeout defaults to **10 minutes**, up from 2. It covers the whole
+  PUT, so the old value aborted healthy 100 MB uploads on a slow connection.
+  `INSTANTSTUDIO_FILES_TIMEOUT_MS` still overrides it; the README now says it is a
+  total, not a stall, timeout.
+
+## 0.2.0 — 2026-10-27
 
 - `upload_file` returns the upload's **`asset_id`** (its uuid), the one file handle
   the InstantStudio remote tools take; the server retired the 12-character
