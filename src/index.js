@@ -34,12 +34,20 @@ const TOOLS = [
     description:
       "Upload a LOCAL file to InstantStudio: PUT its bytes to the `upload_url` that asset_upload returned. " +
       "Returns { asset_id, byte_size, mime_type }: put asset_id into image slots (app_run, the typed app tools, " +
-      "draft_update) or canvas fields. No hashing or headers needed; the server derives size/type from the bytes.",
+      "draft_update) or canvas fields. No hashing or headers needed; the server derives size/type from the bytes. " +
+      "Also pass the `lookup_url` when asset_upload returned one: the file is then hashed locally and the server " +
+      "is asked whether this team already holds those bytes — a hit returns the existing asset_id (reused: true) " +
+      "without spending bandwidth on the upload.",
     inputSchema: {
       type: "object",
       properties: {
         path: { type: "string", description: "Absolute path to the local file to upload." },
-        upload_url: { type: "string", description: "The upload_url from asset_upload." }
+        upload_url: { type: "string", description: "The upload_url from asset_upload." },
+        lookup_url: {
+          type: "string",
+          description: "The lookup_url from asset_upload, when it returned one. Optional: enables the " +
+            "duplicate preflight (hash locally, skip the PUT when the team already has these bytes)."
+        }
       },
       required: ["path", "upload_url"]
     }
@@ -61,7 +69,7 @@ function replyError(id, code, message) {
 async function runTool(name, args) {
   switch (name) {
     case "upload_file":
-      return uploadFile(args?.path, args?.upload_url);
+      return uploadFile(args?.path, args?.upload_url, args?.lookup_url);
     default:
       throw new ToolError(`Unknown tool: ${name}`);
   }

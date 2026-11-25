@@ -20,16 +20,33 @@ under `npx`.
 ## The flow
 
 ```
-asset_upload(filename?)               -> { upload_url, expires_at }     [remote tool]
-upload_file(path, upload_url)         -> { asset_id, byte_size, mime_type }
-use asset_id in image slots or canvas fields                           [remote tools]
+asset_upload(filename?)               -> { upload_url, lookup_url, expires_at }  [remote tool]
+upload_file(path, upload_url, lookup_url?) -> { asset_id, byte_size, mime_type }
+use asset_id in image slots or canvas fields                             [remote tools]
 ```
 
 The server derives size, checksum, and content type from the uploaded stream and
 returns the upload's **`asset_id`**, the durable handle the agent uses afterwards in
 image slots (`app_run`, the typed app tools, `draft_update`) and canvas fields. No
-hashing, no checksums, no headers to manage. The server's response is passed through
-as it is.
+hashing, no checksums, no headers to manage on the agent's side. The server's
+response is passed through as it is.
+
+### Duplicate preflight
+
+When `asset_upload` also returned a `lookup_url`, pass it along: the helper hashes
+the file locally (base64 MD5 — the same value the server derives from the stream)
+and asks `GET /u/:slug/lookup` whether this team already holds those bytes before
+spending bandwidth on the PUT.
+
+- **Hit (200)** — the existing `asset_id` comes back (`reused: true`) and nothing
+  is uploaded.
+- **Miss (404)** — the lookup only peeks (it doesn't consume the slug), so the
+  PUT proceeds as usual.
+- **`400`/`410`** — the slug itself is malformed or expired: the tool fails and
+  the agent should call `asset_upload` again for a fresh pair of URLs.
+- **Any other lookup failure** — best-effort: the PUT runs anyway. The preflight
+  is an optimization, never the authority — the server still derives
+  size/checksum/type from the stream whenever bytes do travel.
 
 ## Requirements
 
@@ -49,7 +66,7 @@ MCP server alongside the InstantStudio remote server, then reconnect.
     },
     "instantstudio-files": {
       "command": "npx",
-      "args": ["-y", "@instantstudio/mcp-files@0.2.0"]
+      "args": ["-y", "@instantstudio/mcp-files@0.3.0"]
     }
   }
 }
@@ -62,12 +79,16 @@ InstantStudio remote server is planned; until then, add the two entries above ma
 
 ## Tool
 
-### `upload_file(path, upload_url)`
+### `upload_file(path, upload_url, lookup_url?)`
 PUT the local file at `path` to the `upload_url` from `asset_upload`. Sends the
 file's extension-guessed `Content-Type` as a hint (the server sniffs the real type).
 Returns `{ ok, bytes, asset_id, byte_size, mime_type }`, or a `ToolError` carrying the
 server's HTTP status on rejection (e.g. `410` = the upload_url expired → call
 `asset_upload` again).
+
+With the optional `lookup_url` (from `asset_upload`), the duplicate preflight
+described above runs first: a hit returns the existing `asset_id` with
+`reused: true` and skips the PUT entirely.
 
 ## Environment variables
 
@@ -87,7 +108,9 @@ All optional:
   default it **refuses any non-`https` URL except `localhost`** (dev) — blocking
   plain-http exfiltration targets. For stronger protection, pin the allowed host(s) with
   `INSTANTSTUDIO_FILES_ALLOWED_HOSTS`; when set, only those hosts are allowed. Use the
-  helper only with the InstantStudio remote server.
+  helper only with the InstantStudio remote server. The same policy governs the
+  `lookup_url`, and the preflight sends only the file's checksum and byte size — never
+  the bytes.
 - **Bounded.** Uploads are size-capped and time out (see the table above), so a bad path
   or a stalled endpoint can't exhaust memory or hang the agent.
 - **Zero dependencies** — nothing transitive to audit.

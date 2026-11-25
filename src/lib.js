@@ -3,17 +3,26 @@
 // built-ins only (no dependencies).
 //
 // Flow (docs/decisions/pending-upload-state-in-redis.md in pawsome-ai-web):
-//   (remote) asset_upload(filename?)         -> { upload_url, expires_at }
-//   upload_file(path, upload_url)            -> { ok, asset_id, byte_size, mime_type }
+//   (remote) asset_upload(filename?)         -> { upload_url, lookup_url, expires_at }
+//   upload_file(path, upload_url, lookup_url?) -> { ok, asset_id, byte_size, mime_type }
 //   (remote) use asset_id in image slots (app_run, the typed app tools,
 //            draft_update) or canvas fields
 //
-// The server derives size/checksum/type from the stream and returns the upload's
-// `asset_id` (its uuid), the one file handle the remote tools take. Bytes never
-// pass through the model. The server's response is passed through as it is, so a
-// field the server adds reaches the agent without a release here.
+// With a lookup_url the helper preflights (Uploads::Lookup, GET /u/:slug/lookup):
+// it hashes the exact bytes it is about to PUT and asks whether this team already
+// holds them, so a duplicate never spends bandwidth travelling to the server. A
+// hit returns the existing asset_id and skips the PUT; a miss is a 404 and the
+// slug stays intact for the PUT. The preflight is an optimization, never the
+// authority — the server still derives size/checksum/type from the stream
+// whenever the PUT does happen.
+//
+// Either way the server returns the upload's `asset_id` (its uuid), the one file
+// handle the remote tools take. Bytes never pass through the model. The server's
+// response is passed through as it is, so a field the server adds reaches the
+// agent without a release here.
 
 import { stat, readFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { extname } from "node:path";
 
 // User-facing failures (bad path, rejected upload). Anything else is unexpected.
@@ -95,11 +104,71 @@ async function statFile(path) {
   return st;
 }
 
+// The preflight half of the upload (Uploads::Lookup in pawsome-ai-web): GET
+// /u/:slug/lookup with the checksum of the EXACT bytes we would PUT (base64 MD5
+// — the same value ActiveStorage stores and the server derives from the stream)
+// plus the byte size. The slug is the capability, so the same URL policy as the
+// upload applies; the lookup sends checksum and size only, never bytes.
+//
+// Decision, mirroring the server's asset_upload guidance:
+//   200       -> hit: return the payload ({ asset_id, byte_size, mime_type,
+//                reused: true }) and skip the PUT
+//   404       -> miss: return null; the slug was only peeked, so PUT as usual
+//   400 / 410 -> the slug itself is malformed or expired, so the PUT would fail
+//                too: throw and have the agent re-mint with asset_upload
+//   other     -> best-effort: return null and let the PUT decide (the preflight
+//                is an optimization, never the authority)
+async function preflightLookup(lookupUrl, body) {
+  assertUploadUrlAllowed(lookupUrl);
+  const url = new URL(lookupUrl);
+  url.searchParams.set("checksum", createHash("md5").update(body).digest("base64"));
+  url.searchParams.set("byte_size", String(body.length));
+
+  const controller = new AbortController();
+  const timeout = envNumber("INSTANTSTUDIO_FILES_TIMEOUT_MS", DEFAULT_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeout);
+
+  let res;
+  try {
+    res = await fetch(url, { method: "GET", signal: controller.signal });
+  } catch {
+    return null; // no answer is not an answer — upload anyway
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (res.status === 400 || res.status === 410) {
+    let detail = "";
+    try {
+      detail = (await res.text()).slice(0, 300);
+    } catch {
+      /* body may be empty */
+    }
+    throw new ToolError(
+      `Lookup rejected: HTTP ${res.status} ${res.statusText}${detail ? " — " + detail : ""} — ` +
+      "the slug is unusable; call asset_upload again for a fresh upload_url/lookup_url."
+    );
+  }
+  if (res.status === 404) return null;
+  if (!res.ok) return null;
+
+  try {
+    const payload = await res.json();
+    return payload?.asset_id ? payload : null; // a hit we can't act on isn't a hit
+  } catch {
+    return null;
+  }
+}
+
 // PUT the file to the short upload URL. No checksum, no required headers — the
 // server derives everything from the stream. Returns the server's response
 // (notably `asset_id`) merged with the local byte count. Bounded by a size cap
 // (we buffer the file) and a request timeout.
-export async function uploadFile(path, uploadUrl) {
+//
+// With a lookup_url (from asset_upload), preflight first: on a hit the existing
+// asset_id comes back (reused: true) and no bytes travel; on a miss or any
+// non-answer the PUT proceeds as usual.
+export async function uploadFile(path, uploadUrl, lookupUrl) {
   if (typeof uploadUrl !== "string" || !uploadUrl) throw new ToolError("upload_url is required");
   const st = await statFile(path);
   assertUploadUrlAllowed(uploadUrl);
@@ -111,7 +180,14 @@ export async function uploadFile(path, uploadUrl) {
     );
   }
 
+  // Read once: the same buffer feeds the preflight checksum and the PUT, so the
+  // checksum always describes the exact bytes that would travel.
   const body = await readFile(path);
+
+  if (typeof lookupUrl === "string" && lookupUrl) {
+    const hit = await preflightLookup(lookupUrl, body);
+    if (hit) return { ok: true, bytes: st.size, reused: true, ...hit };
+  }
 
   const controller = new AbortController();
   const timeout = envNumber("INSTANTSTUDIO_FILES_TIMEOUT_MS", DEFAULT_TIMEOUT_MS);

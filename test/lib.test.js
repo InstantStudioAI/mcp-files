@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
+import { createHash } from "node:crypto";
 import { writeFile, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -143,4 +144,124 @@ test("hostAllowlistConfigured reflects the env", () => {
   assert.equal(hostAllowlistConfigured(""), false);
   assert.equal(hostAllowlistConfigured("  "), false);
   assert.equal(hostAllowlistConfigured("instantstudio.ai"), true);
+});
+
+// A sink that records every request and answers GET (the lookup) and PUT per the
+// given statuses; status 0 means "never respond" (forces a timeout).
+function makeSink({ lookupStatus = 404, lookupBody = '{"error":"not_found"}', putStatus = 201, putPayload = {} } = {}) {
+  const requests = [];
+  const server = createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      requests.push({ method: req.method, url: req.url, body: Buffer.concat(chunks) });
+      const status = req.method === "GET" ? lookupStatus : putStatus;
+      if (status === 0) return; // never respond → client timeout
+      res.statusCode = status;
+      res.setHeader("Content-Type", "application/json");
+      res.end(req.method === "GET" ? lookupBody : JSON.stringify(putPayload));
+    });
+  });
+  return { server, requests };
+}
+
+test("uploadFile with lookup_url: a hit returns the existing asset_id and skips the PUT", async () => {
+  const bytes = Buffer.from("duplicate bytes");
+  const hit = { asset_id: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeffff0000", byte_size: bytes.length, mime_type: "image/png", reused: true };
+  const { server, requests } = makeSink({ lookupStatus: 200, lookupBody: JSON.stringify(hit) });
+  const port = await listen(server);
+  const { path, cleanup } = await withTempFile(bytes, "dup.png");
+  try {
+    const r = await uploadFile(path, `http://127.0.0.1:${port}/u/ABCDEFGHJKMN`, `http://127.0.0.1:${port}/u/ABCDEFGHJKMN/lookup`);
+    assert.equal(r.ok, true);
+    assert.equal(r.reused, true);
+    assert.equal(r.asset_id, hit.asset_id);
+    assert.equal(r.bytes, bytes.length);
+    assert.deepEqual(requests.map((q) => q.method), ["GET"]); // no PUT happened
+    // the query carried the base64-MD5 checksum of the exact bytes + the byte size
+    const q = new URL(requests[0].url, `http://127.0.0.1:${port}`).searchParams;
+    assert.equal(q.get("checksum"), createHash("md5").update(bytes).digest("base64"));
+    assert.equal(q.get("byte_size"), String(bytes.length));
+  } finally {
+    await cleanup();
+    server.close();
+  }
+});
+
+test("uploadFile with lookup_url: a miss (404) leaves the slug intact and PUTs as usual", async () => {
+  const bytes = Buffer.from("fresh bytes");
+  const { server, requests } = makeSink({ lookupStatus: 404, putPayload: { asset_id: "3f2b6c1e-8a4d-4f7b-9c2e-5d1a7b8e9f00", byte_size: bytes.length, mime_type: "image/png" } });
+  const port = await listen(server);
+  const { path, cleanup } = await withTempFile(bytes, "new.png");
+  try {
+    const r = await uploadFile(path, `http://127.0.0.1:${port}/u/ABCDEFGHJKMN`, `http://127.0.0.1:${port}/u/ABCDEFGHJKMN/lookup`);
+    assert.equal(r.ok, true);
+    assert.equal(r.asset_id, "3f2b6c1e-8a4d-4f7b-9c2e-5d1a7b8e9f00");
+    assert.equal(r.reused, undefined);
+    assert.deepEqual(requests.map((q) => q.method), ["GET", "PUT"]);
+    assert.deepEqual(requests[1].body, bytes);
+  } finally {
+    await cleanup();
+    server.close();
+  }
+});
+
+test("uploadFile with lookup_url: 400/410 mean the slug is dead — fail fast, no doomed PUT", async () => {
+  const { server, requests } = makeSink({ lookupStatus: 410, lookupBody: '{"error":"slug_expired"}', putPayload: { asset_id: "never" } });
+  const port = await listen(server);
+  const { path, cleanup } = await withTempFile(Buffer.from("x"), "x.png");
+  try {
+    await assert.rejects(
+      () => uploadFile(path, `http://127.0.0.1:${port}/u/ABCDEFGHJKMN`, `http://127.0.0.1:${port}/u/ABCDEFGHJKMN/lookup`),
+      (e) => e instanceof ToolError && /410/.test(e.message) && /asset_upload/.test(e.message)
+    );
+    assert.deepEqual(requests.map((q) => q.method), ["GET"]); // the PUT never ran
+  } finally {
+    await cleanup();
+    server.close();
+  }
+});
+
+test("uploadFile with lookup_url: any other lookup failure is best-effort — PUT anyway", async () => {
+  const bytes = Buffer.from("best-effort bytes");
+  const { server, requests } = makeSink({ lookupStatus: 500, putPayload: { asset_id: "3f2b6c1e-8a4d-4f7b-9c2e-5d1a7b8e9f00" } });
+  const port = await listen(server);
+  const { path, cleanup } = await withTempFile(bytes, "bf.png");
+  try {
+    const r = await uploadFile(path, `http://127.0.0.1:${port}/u/ABCDEFGHJKMN`, `http://127.0.0.1:${port}/u/ABCDEFGHJKMN/lookup`);
+    assert.equal(r.ok, true);
+    assert.equal(r.asset_id, "3f2b6c1e-8a4d-4f7b-9c2e-5d1a7b8e9f00");
+    assert.deepEqual(requests.map((q) => q.method), ["GET", "PUT"]);
+  } finally {
+    await cleanup();
+    server.close();
+  }
+});
+
+test("uploadFile with lookup_url: a stalled lookup times out and the PUT still happens", async () => {
+  const { server, requests } = makeSink({ lookupStatus: 0, putPayload: { asset_id: "3f2b6c1e-8a4d-4f7b-9c2e-5d1a7b8e9f00" } });
+  const port = await listen(server);
+  const { path, cleanup } = await withTempFile(Buffer.from("x"), "x.png");
+  try {
+    await withEnv({ INSTANTSTUDIO_FILES_TIMEOUT_MS: "80" }, async () => {
+      const r = await uploadFile(path, `http://127.0.0.1:${port}/u/ABCDEFGHJKMN`, `http://127.0.0.1:${port}/u/ABCDEFGHJKMN/lookup`);
+      assert.equal(r.ok, true);
+      assert.deepEqual(requests.map((q) => q.method), ["GET", "PUT"]);
+    });
+  } finally {
+    await cleanup();
+    server.close();
+  }
+});
+
+test("uploadFile with lookup_url: the lookup_url is under the same URL policy as the upload", async () => {
+  const { path, cleanup } = await withTempFile(Buffer.from("x"), "x.png");
+  try {
+    await assert.rejects(
+      () => uploadFile(path, "https://toolkit.instantstudio.ai/u/x", "http://evil.example/collect"),
+      /non-https/
+    );
+  } finally {
+    await cleanup();
+  }
 });
