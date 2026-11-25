@@ -17,7 +17,15 @@ test("stdio server: initialize, tools/list, tools/call, errors", async () => {
     req.on("data", (c) => chunks.push(c));
     req.on("end", () => {
       captured.method = req.method;
+      (captured.methods ||= []).push(req.method);
       captured.body = Buffer.concat(chunks);
+      if (req.method === "GET") {
+        // the lookup preflight: the sink claims the team already holds these bytes
+        res.statusCode = 200;
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify({ asset_id: "ccccdddd-1111-4aaa-8bbb-eeeeffff0000", byte_size: 0, mime_type: "image/png", reused: true }));
+        return;
+      }
       res.statusCode = 201;
       res.setHeader("Content-Type", "application/json");
       res.end(JSON.stringify({ asset_id: "3f2b6c1e-8a4d-4f7b-9c2e-5d1a7b8e9f00", byte_size: captured.body.length, mime_type: "image/png" }));
@@ -90,6 +98,22 @@ test("stdio server: initialize, tools/list, tools/call, errors", async () => {
     send({ jsonrpc: "2.0", id: 5, method: "does/not/exist" });
     const unknown = await waitFor(5);
     assert.equal(unknown.error.code, -32601);
+
+    // tools/call — with a lookup_url the preflight hit returns the existing
+    // asset_id without spending bandwidth on a PUT
+    send({
+      jsonrpc: "2.0", id: 6, method: "tools/call",
+      params: {
+        name: "upload_file",
+        arguments: { path, upload_url: `http://127.0.0.1:${port}/u/ABCDEFGHJKMN`, lookup_url: `http://127.0.0.1:${port}/u/ABCDEFGHJKMN/lookup` }
+      }
+    });
+    const deduped = await waitFor(6);
+    assert.equal(deduped.result.isError, false);
+    assert.equal(deduped.result.structuredContent.asset_id, "ccccdddd-1111-4aaa-8bbb-eeeeffff0000");
+    assert.equal(deduped.result.structuredContent.reused, true);
+    assert.equal(captured.methods.at(-1), "GET");
+    assert.equal(captured.methods.filter((m) => m === "PUT").length, 1); // only the id-3 call PUT
 
     // the notification produced no id-less response
     assert.equal(responses.filter((r) => r.id === undefined).length, 0);

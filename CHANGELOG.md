@@ -3,7 +3,20 @@
 All notable changes are documented here. This project follows
 [Semantic Versioning](https://semver.org).
 
-## 0.2.0 — unreleased
+## 0.3.0 — unreleased
+
+- `upload_file` takes an optional **`lookup_url`** (the remote `asset_upload` now
+  returns one alongside `upload_url`). The helper then preflights against
+  `GET /u/:slug/lookup` (Uploads::Lookup): it hashes the exact bytes it would PUT
+  (base64 MD5 — the value ActiveStorage stores) plus the byte size and asks whether
+  this team already holds them. A hit returns the existing `asset_id` (`reused:
+  true`) and skips the PUT; a 404 miss only peeks, leaving the slug intact for the
+  PUT; 400/410 mean the slug is dead, so the tool fails fast (no doomed PUT) and
+  points at re-minting with `asset_upload`; any other lookup failure is
+  best-effort and the PUT runs anyway. The `lookup_url` sits under the same URL
+  policy as the `upload_url` (`INSTANTSTUDIO_FILES_ALLOWED_HOSTS` / https-or-localhost).
+
+## 0.2.0 — 2026-10-27
 
 - `upload_file` returns the upload's **`asset_id`** (its uuid), the one file handle
   the InstantStudio remote tools take; the server retired the 12-character
