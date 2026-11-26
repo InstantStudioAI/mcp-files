@@ -3,7 +3,7 @@
 All notable changes are documented here. This project follows
 [Semantic Versioning](https://semver.org).
 
-## 0.3.0 — unreleased
+## 0.3.0 — 2026-11-26
 
 - `upload_file` takes an optional **`lookup_url`** (the remote `asset_upload` now
   returns one alongside `upload_url`). The helper then preflights against
@@ -15,6 +15,16 @@ All notable changes are documented here. This project follows
   points at re-minting with `asset_upload`; any other lookup failure is
   best-effort and the PUT runs anyway. The `lookup_url` sits under the same URL
   policy as the `upload_url` (`INSTANTSTUDIO_FILES_ALLOWED_HOSTS` / https-or-localhost).
+- The size cap defaults to **100 MB** (`104857600`), up from 25 MB, to match the
+  InstantStudio upload limit, which now reads the platform's
+  `max_upload_file_size_mb` (100 MB by default) so a finished 1080P video can be
+  uploaded. `INSTANTSTUDIO_FILES_MAX_BYTES` still overrides it.
+- The request timeout defaults to **10 minutes**, up from 2. It covers the whole
+  PUT, so the old value aborted healthy 100 MB uploads on a slow connection.
+  `INSTANTSTUDIO_FILES_TIMEOUT_MS` still overrides it; the README now says it is a
+  total, not a stall, timeout. The duplicate preflight is a small GET, so it waits
+  at most 30 seconds (or the configured timeout, when that is shorter) before the
+  PUT goes ahead.
 
 ## 0.2.0 — 2026-10-27
 
